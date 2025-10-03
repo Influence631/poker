@@ -69,6 +69,13 @@ player_data.json
 poker_debug_*.txt
 *.log
 
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+*.md
+CLAUDE.md
 # Card images (large files)
 Playing Cards/
 *.png

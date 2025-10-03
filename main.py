@@ -163,6 +163,9 @@ class PokerGUI:
         self.blinds_posted = False  # Track if blinds have been posted this hand
         self.current_acting_player = None  # Who is currently making a decision
 
+        # Role-based action order system
+        self.player_roles = {}  # Maps player -> role ("SB", "BB", "Dealer", None)
+
         # Debug logging
         self.debug_log = []
         self.hand_number = 0
@@ -171,12 +174,16 @@ class PokerGUI:
         # Universal turn timer (for all players)
         self.turn_timer = 0
         self.turn_time_limit = 600  # 10 seconds at 60 FPS
-        self.bot_min_think_time = 60  # Minimum 1 second for bots
+        self.current_bot_think_time = 60  # Required think time for current bot
 
         # Bet/raise input
         self.showing_bet_dialog = False
         self.bet_input = ""
         self.bet_action = ""  # "bet" or "raise"
+
+        # Blinds posting state
+        self.posting_blinds_state = None  # None, "posting_sb", "waiting_sb", "posting_bb", "waiting_bb"
+        self.blinds_animation_timer = 0
 
     def load_player(self) -> Player:
         """Load or create player."""
@@ -263,6 +270,11 @@ class PokerGUI:
             self.message_timer -= 1
 
         if self.state == "playing":
+            # Handle blinds posting animation
+            if self.posting_blinds_state is not None:
+                self.update_blinds_animation()
+                return  # Don't process other actions while posting blinds
+
             # Decrement delays FIRST (before any other logic)
             if self.bot_action_delay > 0:
                 self.bot_action_delay -= 1
@@ -285,7 +297,7 @@ class PokerGUI:
 
                 # Bot minimum think time + decision
                 elif self.current_acting_player != self.player:
-                    if self.turn_timer >= self.bot_min_think_time:
+                    if self.turn_timer >= self.current_bot_think_time:
                         # Bot has thought long enough, make decision
                         if self.current_acting_player:  # Double check still exists
                             self.process_bot_action(self.current_acting_player)
@@ -389,6 +401,7 @@ class PokerGUI:
         elif action.startswith("Call"):
             actual_bet = self.player.bet(call_amount)
             self.game.pot += actual_bet
+            self.game.player_contributions[self.player] = self.game.player_contributions.get(self.player, 0) + actual_bet
             self.action_history.append(f"{self.player.name} calls ${actual_bet}")
             self.show_message(f"{self.player.name} calls ${actual_bet}", 90)
             self.log_debug(f"{self.current_round.upper()}: {self.player.name} (pos {player_pos}) CALLS ${actual_bet} (pot: ${self.game.pot}, chips: {self.player.chips})")
@@ -419,6 +432,7 @@ class PokerGUI:
 
                 actual_bet = self.player.bet(amount)
                 self.game.pot += actual_bet
+                self.game.player_contributions[self.player] = self.game.player_contributions.get(self.player, 0) + actual_bet
                 self.game.current_bet = self.player.current_bet
                 self.game.min_raise = amount
                 self.action_history.append(f"{self.player.name} bets ${actual_bet}")
@@ -435,6 +449,7 @@ class PokerGUI:
                 total_bet = call_amount + amount
                 actual_bet = self.player.bet(total_bet)
                 self.game.pot += actual_bet
+                self.game.player_contributions[self.player] = self.game.player_contributions.get(self.player, 0) + actual_bet
                 self.game.current_bet = self.player.current_bet
                 self.game.min_raise = amount
                 self.action_history.append(f"{self.player.name} raises ${amount}")
@@ -452,7 +467,7 @@ class PokerGUI:
             self.show_message("Invalid amount!", 90)
 
     def process_next_action(self):
-        """Process next bot action or advance game."""
+        """Process next bot action or advance game using role-based action order."""
         self.log_debug(f"process_next_action called - round: {self.current_round}, blinds_posted: {self.blinds_posted}")
 
         # Check if only one player remains
@@ -466,42 +481,13 @@ class PokerGUI:
             self.post_blinds_animated()
             return
 
-        # Determine betting order (proper poker rules)
-        num_players = len(self.game.all_players)
+        # Build action order based on roles
+        action_order = self._get_action_order_by_roles()
 
-        # Get positions
-        sb_pos = (self.game.dealer_position + 1) % num_players
-        bb_pos = (self.game.dealer_position + 2) % num_players
-
-        # Pre-flop: Start after BB (UTG position), BB acts LAST
-        # Post-flop: Start after dealer (SB position)
-        if self.current_round == "pre-flop":
-            # UTG is after BB: dealer + 3 positions
-            start_pos = (self.game.dealer_position + 3) % num_players
-
-            # Pre-flop special case: BB always gets option to act last
-            # Build action order: UTG -> ... -> SB -> BB
-            action_order = []
-            for i in range(num_players):
-                pos = (start_pos + i) % num_players
-                action_order.append(pos)
-
-            # Ensure BB is at the end if not already there
-            if action_order[-1] != bb_pos and bb_pos in action_order:
-                action_order.remove(bb_pos)
-                action_order.append(bb_pos)
-
-            self.log_debug(f"Pre-flop action order: {[self.game.all_players[p].name for p in action_order]}")
-        else:
-            # Post-flop: simple order starting from SB
-            start_pos = (self.game.dealer_position + 1) % num_players
-            action_order = [(start_pos + i) % num_players for i in range(num_players)]
-            self.log_debug(f"Post-flop action order: {[self.game.all_players[p].name for p in action_order]}")
+        self.log_debug(f"{self.current_round.upper()} action order: {[f'{p.name}({self.player_roles.get(p, 'None')})' for p in action_order]}")
 
         # Find next player to act using the action order
-        for player_index in action_order:
-            player = self.game.all_players[player_index]
-
+        for player in action_order:
             # Skip if player already acted, folded, or all-in
             if player in self.players_acted or player.folded or player.all_in:
                 continue
@@ -517,7 +503,14 @@ class PokerGUI:
                 self.current_acting_player = player
                 self.turn_timer = 0  # Reset timer for new player
 
-                self.log_debug(f"Next to act: {player.name} (pos {player_index}, bet: ${player.current_bet}, current_bet: ${self.game.current_bet})")
+                # Set think time based on bot difficulty (if bot)
+                if isinstance(player, AIBot):
+                    self.current_bot_think_time = self._get_bot_think_time(player)
+                else:
+                    self.current_bot_think_time = 0  # Player doesn't need think time
+
+                role = self.player_roles.get(player, "None")
+                self.log_debug(f"Next to act: {player.name} (role: {role}, bet: ${player.current_bet}, current_bet: ${self.game.current_bet})")
 
                 if player == self.player:
                     self.waiting_for_player = True
@@ -529,31 +522,106 @@ class PokerGUI:
         self.current_acting_player = None
         self.advance_round()
 
+    def _get_action_order_by_roles(self) -> List[Player]:
+        """
+        Get action order based on player roles.
+
+        Pre-flop: None (UTG) → Dealer → SB → BB
+        Post-flop: SB → BB → None (UTG) → Dealer
+
+        Returns list of players in action order.
+        """
+        if self.current_round == "pre-flop":
+            # Pre-flop action order
+            role_order = [None, "Dealer", "SB", "BB"]
+        else:
+            # Post-flop action order (SB acts first)
+            role_order = ["SB", "BB", None, "Dealer"]
+
+        # Build player list in role order
+        action_order = []
+        for role in role_order:
+            for player, player_role in self.player_roles.items():
+                if player_role == role:
+                    action_order.append(player)
+                    break
+
+        return action_order
+
     def post_blinds_animated(self):
-        """Post blinds as animated actions."""
+        """Start blinds posting animation."""
+        self.log_debug(f"--- HAND #{self.hand_number} ---")
+
+        # Assign roles to all players based on dealer position
+        self._assign_player_roles()
+
+        self.log_debug(f"Dealer: {self.game.all_players[self.game.dealer_position].name} (pos {self.game.dealer_position})")
+        self.log_debug(f"Roles: {[(p.name, role) for p, role in self.player_roles.items()]}")
+
+        # Start the blinds posting sequence
+        self.posting_blinds_state = "posting_sb"
+        self.blinds_animation_timer = 0
+
+    def _assign_player_roles(self):
+        """Assign roles (Dealer, SB, BB, None) to all players at start of hand."""
+        self.player_roles = {}
+        num_players = len(self.game.all_players)
+
+        dealer_pos = self.game.dealer_position
+        sb_pos = (dealer_pos + 1) % num_players
+        bb_pos = (dealer_pos + 2) % num_players
+
+        for i, player in enumerate(self.game.all_players):
+            if i == dealer_pos:
+                self.player_roles[player] = "Dealer"
+            elif i == sb_pos:
+                self.player_roles[player] = "SB"
+            elif i == bb_pos:
+                self.player_roles[player] = "BB"
+            else:
+                self.player_roles[player] = None  # No special role (UTG in 4-player)
+
+    def update_blinds_animation(self):
+        """Handle the sequential blinds posting animation."""
         num_players = len(self.game.all_players)
         sb_pos = (self.game.dealer_position + 1) % num_players
         bb_pos = (self.game.dealer_position + 2) % num_players
 
-        self.log_debug(f"--- HAND #{self.hand_number} ---")
-        self.log_debug(f"Dealer: {self.game.all_players[self.game.dealer_position].name} (pos {self.game.dealer_position})")
+        if self.posting_blinds_state == "posting_sb":
+            # Post small blind
+            sb_player = self.game.all_players[sb_pos]
+            sb_amount = self.game.post_blind(sb_pos, self.game.small_blind)
+            self.action_history.append(f"{sb_player.name} posts SB ${sb_amount}")
+            self.show_message(f"{sb_player.name} posts SB ${sb_amount}", 90)
+            self.log_debug(f"SB: {sb_player.name} posts ${sb_amount} (pos {sb_pos}, chips: {sb_player.chips})")
 
-        # Post small blind
-        sb_player = self.game.all_players[sb_pos]
-        sb_amount = self.game.post_blind(sb_pos, self.game.small_blind)
-        self.action_history.append(f"{sb_player.name} posts SB ${sb_amount}")
-        self.show_message(f"{sb_player.name} posts SB ${sb_amount}", 90)
-        self.log_debug(f"SB: {sb_player.name} posts ${sb_amount} (pos {sb_pos}, chips: {sb_player.chips})")
+            self.posting_blinds_state = "waiting_sb"
+            self.blinds_animation_timer = 90  # 1.5 second pause after SB
 
-        # Post big blind
-        bb_player = self.game.all_players[bb_pos]
-        bb_amount = self.game.post_blind(bb_pos, self.game.big_blind)
-        self.action_history.append(f"{bb_player.name} posts BB ${bb_amount}")
-        self.log_debug(f"BB: {bb_player.name} posts ${bb_amount} (pos {bb_pos}, chips: {bb_player.chips})")
-        self.log_debug(f"Pot after blinds: ${self.game.pot}, Current bet: ${self.game.current_bet}")
+        elif self.posting_blinds_state == "waiting_sb":
+            self.blinds_animation_timer -= 1
+            if self.blinds_animation_timer <= 0:
+                self.posting_blinds_state = "posting_bb"
 
-        self.blinds_posted = True
-        self.bot_action_delay = 120  # 2 second pause after blinds
+        elif self.posting_blinds_state == "posting_bb":
+            # Post big blind
+            bb_player = self.game.all_players[bb_pos]
+            bb_amount = self.game.post_blind(bb_pos, self.game.big_blind)
+            self.action_history.append(f"{bb_player.name} posts BB ${bb_amount}")
+            self.show_message(f"{bb_player.name} posts BB ${bb_amount}", 90)
+            self.log_debug(f"BB: {bb_player.name} posts ${bb_amount} (pos {bb_pos}, chips: {bb_player.chips})")
+            self.log_debug(f"Pot after blinds: ${self.game.pot}, Current bet: ${self.game.current_bet}")
+
+            self.posting_blinds_state = "waiting_bb"
+            self.blinds_animation_timer = 90  # 1.5 second pause after BB
+
+        elif self.posting_blinds_state == "waiting_bb":
+            self.blinds_animation_timer -= 1
+            if self.blinds_animation_timer <= 0:
+                # Done posting blinds
+                self.blinds_posted = True
+                self.posting_blinds_state = None
+                self.bot_action_delay = 30  # Brief pause before first action
 
     def process_bot_action(self, bot: Player):
         """Process one bot action."""
@@ -577,6 +645,7 @@ class PokerGUI:
         elif action == "call":
             actual_bet = bot.bet(call_amount)
             self.game.pot += actual_bet
+            self.game.player_contributions[bot] = self.game.player_contributions.get(bot, 0) + actual_bet
             self.action_history.append(f"{bot.name} calls ${actual_bet}")
             self.show_message(f"{bot.name} calls ${actual_bet}", 120)
             self.log_debug(f"{self.current_round.upper()}: {bot.name} (pos {bot_pos}) CALLS ${actual_bet} (pot: ${self.game.pot}, chips: {bot.chips})")
@@ -590,6 +659,7 @@ class PokerGUI:
             total_bet = call_amount + amount
             actual_bet = bot.bet(total_bet)
             self.game.pot += actual_bet
+            self.game.player_contributions[bot] = self.game.player_contributions.get(bot, 0) + actual_bet
             self.game.current_bet = bot.current_bet
             self.game.min_raise = amount
             self.action_history.append(f"{bot.name} raises ${amount}")
@@ -610,20 +680,20 @@ class PokerGUI:
         if self.current_round == "pre-flop":
             self.game.deal_flop()
             self.current_round = "flop"
-            self.show_message("Dealing Flop", 150)
-            self.bot_action_delay = 120  # 2 second pause to show cards
+            self.show_message("Dealing Flop", 100)  # Shorter message duration
+            self.bot_action_delay = 120  # Wait until message is done + buffer
             return  # Allow betting on flop
         elif self.current_round == "flop":
             self.game.deal_turn()
             self.current_round = "turn"
-            self.show_message("Dealing Turn", 150)
-            self.bot_action_delay = 120  # 2 second pause to show cards
+            self.show_message("Dealing Turn", 100)
+            self.bot_action_delay = 120
             return  # Allow betting on turn
         elif self.current_round == "turn":
             self.game.deal_river()
             self.current_round = "river"
-            self.show_message("Dealing River", 150)
-            self.bot_action_delay = 120  # 2 second pause to show cards
+            self.show_message("Dealing River", 100)
+            self.bot_action_delay = 120
             return  # Allow betting on river
         elif self.current_round == "river":
             self.end_hand()
@@ -651,6 +721,8 @@ class PokerGUI:
                 self.bot_action_delay = 120  # 2 second pause to show cards
                 self.action_history = []
                 self.blinds_posted = False
+                self.posting_blinds_state = None  # Reset blinds posting state
+                self.blinds_animation_timer = 0
                 self.players_acted = set()  # Reset who has acted
                 self.current_acting_player = None  # Reset current actor
                 self.turn_timer = 0  # Reset turn timer
@@ -680,6 +752,30 @@ class PokerGUI:
         self.log_debug(f"Players: {[p.name for p in self.game.all_players]}")
         self.log_debug(f"Dealer position: {self.game.dealer_position}")
         self.show_message("Game started!", 120)
+
+    def _get_bot_think_time(self, bot: AIBot) -> int:
+        """
+        Calculate thinking time for a bot based on difficulty.
+        Returns number of frames the bot should "think" before acting.
+        """
+        import random
+
+        # Base thinking times by difficulty (in frames, 60 FPS)
+        if bot.difficulty == "easy":
+            base_time = 60  # 1 second
+            variance = 30  # ±0.5 seconds
+        elif bot.difficulty == "medium":
+            base_time = 120  # 2 seconds
+            variance = 60  # ±1 second
+        else:  # hard
+            base_time = 150  # 2.5 seconds
+            variance = 60  # ±1 second
+
+        # Add randomness so not every decision takes exactly the same time
+        think_time = base_time + random.randint(-variance, variance)
+
+        # Ensure minimum of 30 frames (0.5 seconds)
+        return max(30, think_time)
 
     def log_debug(self, message: str):
         """Add message to debug log."""
@@ -1182,17 +1278,8 @@ class PokerGUI:
         name_text = FONT_SMALL.render(player.name, True, WHITE)
         self.screen.blit(name_text, (x + 10, y + 10))
 
-        # Show dealer/SB/BB indicators
-        indicator_x = x + 150
-        if is_dealer:
-            dealer_text = FONT_TINY.render("(D)", True, GOLD)
-            self.screen.blit(dealer_text, (indicator_x, y + 10))
-        elif is_sb:
-            sb_text = FONT_TINY.render("(SB)", True, LIGHT_GRAY)
-            self.screen.blit(sb_text, (indicator_x - 10, y + 10))
-        elif is_bb:
-            bb_text = FONT_TINY.render("(BB)", True, LIGHT_GRAY)
-            self.screen.blit(bb_text, (indicator_x - 10, y + 10))
+        # Draw graphical position indicators (circles with text)
+        self._draw_position_indicator(x, y, is_dealer, is_sb, is_bb)
 
         chips_text = FONT_SMALL.render(f"${player.chips}", True, GOLD)
         self.screen.blit(chips_text, (x + 10, y + 40))
@@ -1223,6 +1310,71 @@ class PokerGUI:
                 # Add a pattern to show it's face-down
                 pattern_rect = pygame.Rect(card_x + (i * 30) + 3, card_y + 3, card_width - 6, card_height - 6)
                 pygame.draw.rect(self.screen, LIGHT_GRAY, pattern_rect, 1, border_radius=2)
+
+    def _draw_position_indicator(self, x: int, y: int, is_dealer: bool, is_sb: bool, is_bb: bool):
+        """Draw circular position indicator (Dealer, SB, or BB)."""
+        if not (is_dealer or is_sb or is_bb):
+            return
+
+        # Position the indicator to the right of the player panel
+        circle_x = x + 210
+        circle_y = y + 25
+        circle_radius = 20
+
+        # Determine color and text
+        if is_dealer:
+            circle_color = GOLD
+            text = "D"
+            text_color = BLACK
+        elif is_sb:
+            circle_color = (100, 200, 255)  # Light blue
+            text = "SB"
+            text_color = BLACK
+        else:  # is_bb
+            circle_color = (255, 100, 100)  # Light red
+            text = "BB"
+            text_color = BLACK
+
+        # Draw circle with shadow
+        pygame.draw.circle(self.screen, (50, 50, 50), (circle_x + 2, circle_y + 2), circle_radius)
+        pygame.draw.circle(self.screen, circle_color, (circle_x, circle_y), circle_radius)
+        pygame.draw.circle(self.screen, WHITE, (circle_x, circle_y), circle_radius, 2)
+
+        # Draw text centered in circle
+        text_surface = FONT_SMALL.render(text, True, text_color)
+        text_rect = text_surface.get_rect(center=(circle_x, circle_y))
+        self.screen.blit(text_surface, text_rect)
+
+    def _draw_position_indicator_centered(self, x: int, y: int, is_dealer: bool, is_sb: bool, is_bb: bool):
+        """Draw circular position indicator centered at given position."""
+        if not (is_dealer or is_sb or is_bb):
+            return
+
+        circle_radius = 20
+
+        # Determine color and text
+        if is_dealer:
+            circle_color = GOLD
+            text = "D"
+            text_color = BLACK
+        elif is_sb:
+            circle_color = (100, 200, 255)  # Light blue
+            text = "SB"
+            text_color = BLACK
+        else:  # is_bb
+            circle_color = (255, 100, 100)  # Light red
+            text = "BB"
+            text_color = BLACK
+
+        # Draw circle with shadow
+        pygame.draw.circle(self.screen, (50, 50, 50), (x + 2, y + 2), circle_radius)
+        pygame.draw.circle(self.screen, circle_color, (x, y), circle_radius)
+        pygame.draw.circle(self.screen, WHITE, (x, y), circle_radius, 2)
+
+        # Draw text centered in circle
+        text_surface = FONT_SMALL.render(text, True, text_color)
+        text_rect = text_surface.get_rect(center=(x, y))
+        self.screen.blit(text_surface, text_rect)
 
     def draw_player_hand(self):
         """Draw player's hand."""
@@ -1278,6 +1430,19 @@ class PokerGUI:
             bet_text = FONT_SMALL.render(f"Current Bet: ${self.player.current_bet}", True, LIGHT_GRAY)
             bet_rect = bet_text.get_rect(center=(WINDOW_WIDTH // 2, y + card_height + 40))
             self.screen.blit(bet_text, bet_rect)
+
+        # Draw position indicator for player (below their hand)
+        num_players = len(self.game.all_players)
+        sb_pos = (self.game.dealer_position + 1) % num_players
+        bb_pos = (self.game.dealer_position + 2) % num_players
+        is_dealer_player = 0 == self.game.dealer_position
+        is_sb_player = 0 == sb_pos
+        is_bb_player = 0 == bb_pos
+
+        # Draw indicator below the hand, centered
+        indicator_x = WINDOW_WIDTH // 2
+        indicator_y = y + card_height + 65
+        self._draw_position_indicator_centered(indicator_x, indicator_y, is_dealer_player, is_sb_player, is_bb_player)
 
     def draw_action_buttons(self):
         """Draw betting action buttons."""

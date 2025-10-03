@@ -4,6 +4,14 @@ from poker_cards import Card
 from hand_evaluator import HandEvaluator
 import random
 
+# Try to import Claude advisor
+try:
+    from bot_intelligence import get_claude_decision, is_claude_available
+    CLAUDE_AVAILABLE = is_claude_available()
+except ImportError:
+    CLAUDE_AVAILABLE = False
+    get_claude_decision = None
+
 
 class Player:
     """Represents a poker player."""
@@ -91,7 +99,7 @@ class AIBot(Player):
     def make_decision(self, pot: int, current_bet: int, community_cards: List[Card],
                       min_raise: int) -> tuple[str, int]:
         """
-        Make a betting decision using pot odds.
+        Make a betting decision using pot odds or Claude API.
         Returns (action, amount) where action is 'fold', 'call', 'raise', or 'check'
         """
         call_amount = current_bet - self.current_bet
@@ -99,6 +107,50 @@ class AIBot(Player):
         # Can't continue if no chips
         if self.chips == 0:
             return ("check", 0)
+
+        # Try Claude API first if available and difficulty is medium/hard
+        # Easy difficulty (0% API) always uses mathematical fallback
+        if CLAUDE_AVAILABLE and self.difficulty in ["medium", "hard"]:
+            # Use Claude API with probability based on difficulty
+            # Medium: 40%, Hard: 70%
+            use_claude_prob = 0.7 if self.difficulty == "hard" else 0.4
+            if random.random() < use_claude_prob:
+                claude_decision = self._try_claude_decision(pot, current_bet, community_cards, min_raise)
+                if claude_decision:
+                    return claude_decision
+                # If Claude fails, fall through to mathematical decision
+
+        # Fall back to mathematical decision-making
+        return self._mathematical_decision(pot, current_bet, community_cards, min_raise)
+
+    def _try_claude_decision(self, pot: int, current_bet: int, community_cards: List[Card],
+                             min_raise: int) -> Optional[tuple[str, int]]:
+        """Try to get a decision from Claude API."""
+        try:
+            # Count active opponents (simplified - would need game context)
+            opponents = 3  # Assuming 4 players total
+
+            # Build game state
+            game_state = {
+                "hand": [str(card) for card in self.hand],
+                "community_cards": [str(card) for card in community_cards],
+                "pot": pot,
+                "current_bet": current_bet,
+                "player_bet": self.current_bet,
+                "chips": self.chips,
+                "min_raise": min_raise,
+                "opponents": opponents
+            }
+
+            return get_claude_decision(game_state, self.difficulty)
+        except Exception as e:
+            print(f"Claude decision error: {e}")
+            return None
+
+    def _mathematical_decision(self, pot: int, current_bet: int, community_cards: List[Card],
+                                min_raise: int) -> tuple[str, int]:
+        """Original mathematical decision-making logic."""
+        call_amount = current_bet - self.current_bet
 
         # Check if pre-flop or post-flop
         is_preflop = len(community_cards) == 0

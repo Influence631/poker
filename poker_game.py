@@ -15,6 +15,7 @@ class PokerGame:
         self.deck = Deck()
         self.community_cards: List[Card] = []
         self.pot = 0
+        self.player_contributions: Dict[Player, int] = {}  # Track each player's contribution to pot
         self.small_blind = small_blind
         self.big_blind = small_blind * 2
         self.current_bet = 0
@@ -37,6 +38,7 @@ class PokerGame:
         self.deck.reset()
         self.community_cards = []
         self.pot = 0
+        self.player_contributions = {p: 0 for p in self.all_players}  # Reset contributions
         self.current_bet = 0
         self.min_raise = self.big_blind
 
@@ -53,6 +55,7 @@ class PokerGame:
         player = self.all_players[player_pos]
         actual_amount = player.bet(amount)
         self.pot += actual_amount
+        self.player_contributions[player] = self.player_contributions.get(player, 0) + actual_amount
         if amount == self.big_blind:
             self.current_bet = self.big_blind
         return actual_amount
@@ -67,11 +70,13 @@ class PokerGame:
         sb_player = self.all_players[small_blind_pos]
         sb_amount = sb_player.bet(self.small_blind)
         self.pot += sb_amount
+        self.player_contributions[sb_player] = self.player_contributions.get(sb_player, 0) + sb_amount
 
         # Big blind
         bb_player = self.all_players[big_blind_pos]
         bb_amount = bb_player.bet(self.big_blind)
         self.pot += bb_amount
+        self.player_contributions[bb_player] = self.player_contributions.get(bb_player, 0) + bb_amount
         self.current_bet = self.big_blind
 
     def deal_flop(self):
@@ -159,42 +164,93 @@ class PokerGame:
 
     def determine_winners(self) -> List[tuple[Player, int, str]]:
         """
-        Determine winners and distribute pot.
+        Determine winners and distribute pot with side pot support.
         Returns list of (player, amount_won, hand_name) tuples.
         """
         active_players = [p for p in self.all_players if not p.folded]
 
         if len(active_players) == 1:
-            # Only one player left
+            # Only one player left - they win only what they contributed
             winner = active_players[0]
-            winner.win(self.pot)
-            return [(winner, self.pot, "Opponent(s) folded")]
+            # Calculate total pot that winner is eligible for
+            winner_contribution = self.player_contributions.get(winner, 0)
+            eligible_pot = min(self.pot, sum(min(self.player_contributions.get(p, 0), winner_contribution)
+                                             for p in self.all_players))
+            winner.win(eligible_pot)
+            return [(winner, eligible_pot, "Opponent(s) folded")]
+
+        # Calculate side pots
+        side_pots = self._calculate_side_pots(active_players)
 
         # Evaluate all hands
-        hands = []
+        hands = {}
         for player in active_players:
             full_hand = player.hand + self.community_cards
             rank, tiebreaker = HandEvaluator.evaluate_hand(full_hand)
             hand_name = HandEvaluator.get_hand_name(full_hand)
-            hands.append((player, rank, tiebreaker, hand_name))
+            hands[player] = (rank, tiebreaker, hand_name)
 
-        # Sort by hand strength
-        hands.sort(key=lambda x: (x[1], x[2]), reverse=True)
-
-        # Find all winners (could be multiple in case of tie)
-        best_rank = hands[0][1]
-        best_tiebreaker = hands[0][2]
-        winners = [h for h in hands if h[1] == best_rank and h[2] == best_tiebreaker]
-
-        # Distribute pot
-        winners_share = self.pot // len(winners)
+        # Award each side pot
         results = []
+        for pot_amount, eligible_players in side_pots:
+            # Find best hand among eligible players
+            eligible_hands = [(p, hands[p][0], hands[p][1], hands[p][2])
+                             for p in eligible_players]
+            eligible_hands.sort(key=lambda x: (x[1], x[2]), reverse=True)
 
-        for player, _, _, hand_name in winners:
-            player.win(winners_share)
-            results.append((player, winners_share, hand_name))
+            # Find all winners of this pot (ties possible)
+            best_rank = eligible_hands[0][1]
+            best_tiebreaker = eligible_hands[0][2]
+            pot_winners = [h for h in eligible_hands
+                          if h[1] == best_rank and h[2] == best_tiebreaker]
+
+            # Split pot among winners
+            winners_share = pot_amount // len(pot_winners)
+            for player, _, _, hand_name in pot_winners:
+                player.win(winners_share)
+                # Check if this player already in results (won multiple pots)
+                existing = [r for r in results if r[0] == player]
+                if existing:
+                    # Update amount
+                    idx = results.index(existing[0])
+                    old_amount = results[idx][1]
+                    results[idx] = (player, old_amount + winners_share, hand_name)
+                else:
+                    results.append((player, winners_share, hand_name))
 
         return results
+
+    def _calculate_side_pots(self, active_players: List[Player]) -> List[tuple[int, List[Player]]]:
+        """
+        Calculate side pots based on player contributions.
+        Returns list of (pot_amount, eligible_players) tuples.
+        """
+        # Get contributions of active players
+        contributions = [(p, self.player_contributions.get(p, 0)) for p in active_players]
+
+        # Sort by contribution amount
+        contributions.sort(key=lambda x: x[1])
+
+        pots = []
+        previous_level = 0
+
+        for i, (player, contribution) in enumerate(contributions):
+            if contribution > previous_level:
+                # Create a pot for this level
+                pot_size = (contribution - previous_level) * (len(contributions) - i)
+
+                # Also add contributions from folded players up to this level
+                for folded_player in [p for p in self.all_players if p.folded]:
+                    folded_contribution = self.player_contributions.get(folded_player, 0)
+                    pot_size += max(0, min(contribution, folded_contribution) - previous_level)
+
+                # Players eligible for this pot (all who contributed at least this much)
+                eligible = [p for p, c in contributions if c >= contribution]
+
+                pots.append((pot_size, eligible))
+                previous_level = contribution
+
+        return pots
 
     def get_active_players(self) -> List[Player]:
         """Get players still in the hand."""
