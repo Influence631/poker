@@ -74,6 +74,7 @@ poker_debug_*.txt
 .env.local
 .env.*.local
 
+.claude/
 *.md
 CLAUDE.md
 # Card images (large files)
