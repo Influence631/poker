@@ -161,13 +161,21 @@ class AIBot(Player):
             # If pot odds > odds against (adjusted by threshold), it's profitable to call
             should_call_by_odds = pot_odds_ratio > (odds_against_ratio * pot_odds_threshold)
 
+            # Evaluate bet size relative to stack
+            bet_to_stack_ratio = call_amount / self.chips if self.chips > 0 else 1
+
             # Strong made hand (no need for outs)
             if hand_rank >= 6:  # Flush or better
-                # Almost always call/raise with strong hands
-                if random.random() < 0.9:
-                    if random.random() < aggression and self.chips > call_amount + min_raise:
-                        # Raise
-                        raise_size = int(pot * random.uniform(0.7, 1.5))
+                # Almost always call/raise with strong hands, even big bets
+                if bet_to_stack_ratio > 0.8:  # Huge bet - still call with very strong hand
+                    if random.random() < 0.85:  # 85% call even huge bets
+                        return ("call", min(call_amount, self.chips))
+                    else:
+                        return ("fold", 0)
+                elif random.random() < 0.95:  # 95% of the time with strong hands
+                    if random.random() < aggression * 1.2 and self.chips > call_amount + min_raise:
+                        # Raise more aggressively
+                        raise_size = int(pot * random.uniform(0.8, 2.0))
                         raise_size = max(min_raise, min(raise_size, self.chips - call_amount))
                         return ("raise", raise_size)
                     else:
@@ -175,16 +183,36 @@ class AIBot(Player):
                 else:
                     return ("call", min(call_amount, self.chips))
 
-            # Medium-strong hand with drawing potential
-            elif hand_rank >= 3 or should_call_by_odds:
-                # Call if pot odds are favorable or hand is decent
-                if call_amount <= self.chips:
-                    # Consider raising if hand is strong enough and odds are very good
-                    if hand_rank >= 4 and random.random() < aggression * 0.5:
-                        raise_size = int(pot * random.uniform(0.5, 1.0))
+            # Good made hand (trips, straights)
+            elif hand_rank >= 4:
+                # More willing to call bigger bets with good hands
+                if bet_to_stack_ratio > 0.7:  # Very large bet
+                    if random.random() < 0.5:  # 50% call large bets with good hands
+                        return ("call", min(call_amount, self.chips))
+                    else:
+                        return ("fold", 0)
+                elif bet_to_stack_ratio > 0.4:  # Large bet
+                    if random.random() < 0.75:  # 75% call
+                        return ("call", min(call_amount, self.chips))
+                    else:
+                        return ("fold", 0)
+                else:  # Normal bet
+                    if random.random() < aggression * 0.6:
+                        raise_size = int(pot * random.uniform(0.5, 1.2))
                         raise_size = max(min_raise, min(raise_size, self.chips - call_amount))
                         if raise_size > 0:
                             return ("raise", raise_size)
+                    return ("call", min(call_amount, self.chips))
+
+            # Medium-strong hand with drawing potential
+            elif hand_rank >= 3 or should_call_by_odds:
+                # Call if pot odds are favorable or hand is decent, but fold to huge bets
+                if bet_to_stack_ratio > 0.5:  # Big bet with medium hand
+                    if should_call_by_odds:
+                        return ("call", min(call_amount, self.chips))
+                    else:
+                        return ("fold", 0)
+                elif call_amount <= self.chips:
                     return ("call", min(call_amount, self.chips))
                 else:
                     return ("fold", 0)
@@ -192,9 +220,9 @@ class AIBot(Player):
             # Weak hand
             else:
                 # Only call if pot odds are very good or bluffing
-                if should_call_by_odds and call_amount <= self.chips * 0.2:
+                if should_call_by_odds and bet_to_stack_ratio < 0.3:
                     return ("call", min(call_amount, self.chips))
-                elif random.random() < bluff_rate * 0.5:
+                elif random.random() < bluff_rate * 0.4 and bet_to_stack_ratio < 0.25:
                     return ("call", min(call_amount, self.chips))
                 else:
                     return ("fold", 0)

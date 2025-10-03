@@ -85,11 +85,9 @@ def load_card_images():
                     # Store by card key
                     key = f"{rank.display}{suit.value}"
                     CARD_IMAGES[key] = img
-                    print(f"Loaded {filename} as {key}")
                 except Exception as e:
-                    print(f"Error loading {filename}: {e}")
-
-    print(f"Loaded {len(CARD_IMAGES)} card images")
+                    if len(CARD_IMAGES) == 0:  # Only print if no cards loaded at all
+                        print(f"Error loading {filename}: {e}")
 
 
 class Button:
@@ -168,6 +166,7 @@ class PokerGUI:
         # Debug logging
         self.debug_log = []
         self.hand_number = 0
+        self.debug_mode = False  # Set to True to enable debug logging
 
         # Universal turn timer (for all players)
         self.turn_timer = 0
@@ -210,10 +209,6 @@ class PokerGUI:
         frame_count = 0
         while running:
             mouse_pos = pygame.mouse.get_pos()
-
-            # Debug: print every second
-            if frame_count % 60 == 0:
-                print(f"Frame {frame_count}, state={self.state}")
 
             # Update button hover states
             for button in self.buttons:
@@ -267,10 +262,6 @@ class PokerGUI:
         if self.message_timer > 0:
             self.message_timer -= 1
 
-        if not hasattr(self, '_update_logged') and self.state == "playing":
-            self.log_debug(f"Update() called with state={self.state}")
-            self._update_logged = True
-
         if self.state == "playing":
             # Decrement delays FIRST (before any other logic)
             if self.bot_action_delay > 0:
@@ -302,10 +293,6 @@ class PokerGUI:
 
             # Process next action when no one is currently acting
             elif not self.waiting_for_player and not self.showing_bet_dialog and self.bot_action_delay == 0:
-                # Debug: check why this might not be called
-                if not hasattr(self, '_first_action_logged'):
-                    self.log_debug(f"Calling process_next_action - wait:{self.waiting_for_player}, dialog:{self.showing_bet_dialog}, delay:{self.bot_action_delay}")
-                    self._first_action_logged = True
                 self.process_next_action()
 
     def handle_mouse_click(self, pos: Tuple[int, int]):
@@ -482,43 +469,63 @@ class PokerGUI:
         # Determine betting order (proper poker rules)
         num_players = len(self.game.all_players)
 
-        # Pre-flop: Start after BB (UTG position)
+        # Get positions
+        sb_pos = (self.game.dealer_position + 1) % num_players
+        bb_pos = (self.game.dealer_position + 2) % num_players
+
+        # Pre-flop: Start after BB (UTG position), BB acts LAST
         # Post-flop: Start after dealer (SB position)
         if self.current_round == "pre-flop":
             # UTG is after BB: dealer + 3 positions
             start_pos = (self.game.dealer_position + 3) % num_players
-        else:
-            # Post-flop starts after dealer (SB position)
-            start_pos = (self.game.dealer_position + 1) % num_players
 
-        # Find next player to act
-        checked_count = 0
-        while checked_count < num_players:
-            player_index = (start_pos + checked_count) % num_players
+            # Pre-flop special case: BB always gets option to act last
+            # Build action order: UTG -> ... -> SB -> BB
+            action_order = []
+            for i in range(num_players):
+                pos = (start_pos + i) % num_players
+                action_order.append(pos)
+
+            # Ensure BB is at the end if not already there
+            if action_order[-1] != bb_pos and bb_pos in action_order:
+                action_order.remove(bb_pos)
+                action_order.append(bb_pos)
+
+            self.log_debug(f"Pre-flop action order: {[self.game.all_players[p].name for p in action_order]}")
+        else:
+            # Post-flop: simple order starting from SB
+            start_pos = (self.game.dealer_position + 1) % num_players
+            action_order = [(start_pos + i) % num_players for i in range(num_players)]
+            self.log_debug(f"Post-flop action order: {[self.game.all_players[p].name for p in action_order]}")
+
+        # Find next player to act using the action order
+        for player_index in action_order:
             player = self.game.all_players[player_index]
 
-            # Check if this player needs to act
-            if not player.folded and not player.all_in and player not in self.players_acted:
-                # Player needs to act if:
-                # 1. They haven't matched current bet, OR
-                # 2. Current bet is 0 and they haven't acted yet (everyone gets to check/bet)
-                needs_to_act = (player.current_bet < self.game.current_bet) or \
-                               (self.game.current_bet == 0 and player not in self.players_acted)
+            # Skip if player already acted, folded, or all-in
+            if player in self.players_acted or player.folded or player.all_in:
+                continue
 
-                if needs_to_act:
-                    # This player needs to act - set them as current and return
-                    # The update() loop will handle calling process_bot_action with timer
-                    self.current_acting_player = player
-                    self.turn_timer = 0  # Reset timer for new player
+            # Player needs to act if:
+            # 1. They haven't matched current bet, OR
+            # 2. Current bet is 0 and they haven't acted yet (everyone gets chance to check/bet)
+            needs_to_act = (player.current_bet < self.game.current_bet) or \
+                           (self.game.current_bet == 0)
 
-                    if player == self.player:
-                        self.waiting_for_player = True
+            if needs_to_act:
+                # This player needs to act
+                self.current_acting_player = player
+                self.turn_timer = 0  # Reset timer for new player
 
-                    return
+                self.log_debug(f"Next to act: {player.name} (pos {player_index}, bet: ${player.current_bet}, current_bet: ${self.game.current_bet})")
 
-            checked_count += 1
+                if player == self.player:
+                    self.waiting_for_player = True
+
+                return
 
         # All players have acted - advance round
+        self.log_debug(f"All players acted. Players_acted: {[p.name for p in self.players_acted]}")
         self.current_acting_player = None
         self.advance_round()
 
@@ -668,16 +675,17 @@ class PokerGUI:
         self.players_acted = set()
         self.current_acting_player = None
         self.turn_timer = 0
+        self.state = "playing"
         self.log_debug(f"=== NEW GAME STARTED ===")
         self.log_debug(f"Players: {[p.name for p in self.game.all_players]}")
         self.log_debug(f"Dealer position: {self.game.dealer_position}")
-        self.state = "playing"
-        self.log_debug(f"State set to: {self.state}")
-        self.log_debug(f"Initial values - wait:{self.waiting_for_player}, dialog:{self.showing_bet_dialog}, delay:{self.bot_action_delay}, current_actor:{self.current_acting_player}")
         self.show_message("Game started!", 120)
 
     def log_debug(self, message: str):
         """Add message to debug log."""
+        if not self.debug_mode:
+            return
+
         timestamp = len(self.debug_log)
         log_entry = f"[{timestamp:04d}] {message}"
         self.debug_log.append(log_entry)
@@ -781,14 +789,78 @@ class PokerGUI:
 
         call_amount = self.game.current_bet - self.player.current_bet
 
-        # Pre-flop or no bet to call
+        # Pre-flop evaluation
         if len(self.game.community_cards) < 3:
-            return "Pre-flop", "Pre-flop", "See flop"
+            if call_amount > 0:
+                # Show pot odds even pre-flop
+                pot_after_call = self.game.pot + call_amount
+                pot_odds_ratio = pot_after_call / call_amount
+                pot_odds_str = f"{pot_odds_ratio:.1f}:1"
 
+                # Evaluate pre-flop hand strength
+                card1, card2 = self.player.hand
+                rank1, rank2 = card1.rank.value, card2.rank.value
+
+                if rank1 == rank2:
+                    strength = "Pair"
+                    if rank1 >= 10:
+                        recommendation = "RAISE (strong pair)"
+                    elif rank1 >= 7:
+                        recommendation = "CALL/RAISE (good pair)"
+                    else:
+                        recommendation = "CALL (small pair)"
+                elif max(rank1, rank2) >= 12:
+                    strength = "High card"
+                    recommendation = "CALL (high cards)"
+                else:
+                    strength = "Weak"
+                    if pot_odds_ratio > 4:
+                        recommendation = "CALL (good odds)"
+                    else:
+                        recommendation = "FOLD (weak hand)"
+
+                return pot_odds_str, strength, recommendation
+            else:
+                # No bet to call pre-flop
+                card1, card2 = self.player.hand
+                rank1, rank2 = card1.rank.value, card2.rank.value
+
+                if rank1 == rank2 and rank1 >= 9:
+                    return "No bet", "Strong pair", "BET/RAISE"
+                elif max(rank1, rank2) >= 12:
+                    return "No bet", "High cards", "BET/CHECK"
+                else:
+                    return "No bet", "Speculative", "CHECK"
+
+        # Post-flop with no bet to call - evaluate hand strength and recommend action
         if call_amount == 0:
-            return "N/A", "N/A", "Check/Bet"
+            full_hand = self.player.hand + self.game.community_cards
+            hand_rank, _ = HandEvaluator.evaluate_hand(full_hand)
+            outs = self.calculate_outs()
 
-        # Calculate pot odds: (pot + call_amount) : call_amount
+            known_cards_count = len(self.player.hand) + len(self.game.community_cards)
+            unknown_cards = 52 - known_cards_count
+
+            if outs > 0:
+                odds_against_ratio = (unknown_cards - outs) / outs
+                odds_str = f"{odds_against_ratio:.1f}:1"
+            else:
+                odds_str = "Made hand"
+
+            hand_name = HandEvaluator.get_hand_name(full_hand)
+
+            if hand_rank >= 6:  # Flush or better
+                return "No bet", hand_name, "BET/RAISE (strong)"
+            elif hand_rank >= 4:  # Three of a kind or better
+                return "No bet", hand_name, "BET (good hand)"
+            elif hand_rank >= 2 and outs > 8:  # Pair with many outs
+                return "No bet", f"{outs} outs", "BET/CHECK (draws)"
+            elif outs > 8:  # Strong draw
+                return "No bet", f"{outs} outs", "BET/CHECK (draw)"
+            else:
+                return "No bet", hand_name, "CHECK (weak)"
+
+        # Post-flop with bet to call
         pot_after_call = self.game.pot + call_amount
         pot_odds_ratio = pot_after_call / call_amount if call_amount > 0 else 0
         pot_odds_str = f"{pot_odds_ratio:.1f}:1"
@@ -805,21 +877,28 @@ class PokerGUI:
             odds_against_ratio = (unknown_cards - outs) / outs
             odds_against_str = f"{odds_against_ratio:.1f}:1"
         else:
-            odds_against_str = "No outs"
-            odds_against_ratio = 999  # Very high
-
-        # Make recommendation based on pot odds vs odds against
-        # If pot odds > odds against, it's a good call
-        if outs == 0:
+            # No outs - evaluate current hand strength
             full_hand = self.player.hand + self.game.community_cards
             hand_rank, _ = HandEvaluator.evaluate_hand(full_hand)
+
             if hand_rank >= 6:  # Flush or better
-                recommendation = "CALL/RAISE (strong hand)"
+                odds_against_str = "Made hand"
+                odds_against_ratio = 0  # Already have strong hand
+            elif hand_rank >= 4:  # Three of a kind or better
+                odds_against_str = "Good hand"
+                odds_against_ratio = 0.5
             else:
-                recommendation = "FOLD (no improvement)"
+                odds_against_str = "No outs"
+                odds_against_ratio = 999  # Very high
+
+        # Make recommendation based on pot odds vs odds against
+        if odds_against_ratio == 0:  # Strong made hand
+            recommendation = "CALL/RAISE (strong)"
+        elif outs == 0 and odds_against_ratio == 999:
+            recommendation = "FOLD (no outs)"
         elif pot_odds_ratio > odds_against_ratio:
-            recommendation = "CALL/BET (good odds)"
-        elif pot_odds_ratio > odds_against_ratio * 0.8:  # Close
+            recommendation = "CALL (good odds)"
+        elif pot_odds_ratio > odds_against_ratio * 0.85:
             recommendation = "CALL (marginal)"
         else:
             recommendation = "FOLD (bad odds)"
